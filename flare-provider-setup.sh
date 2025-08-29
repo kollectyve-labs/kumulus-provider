@@ -6,14 +6,16 @@
 set -e
 trap 'echo "❌ Installation failed. Exiting..."; exit 1;' ERR
 
-# ---  ---
 BACKEND_URL="${KUMULUS_API_URL:-http://localhost:8000/api}"
 RESOURCE_ID="${RESOURCE_ID:-}"
 PROVIDER_TOKEN="${PROVIDER_TOKEN:-}"
-FILENAME="flare-agent-v0.1.0-alpha"
-BASTION_ADDRESS=""
-BASTION_PORT=7777
-BASTION_PUB=""
+AGENT_BINARY_NAME="flare-agent-v0.1.0-alpha"
+AGENT_INSTALL_DIR="/opt/kumulus"
+AGENT_BINARY="${AGENT_INSTALL_DIR}/${AGENT_BINARY_NAME}"
+# Bastion configuration - use environment variables with fallback to defaults
+BASTION_ADDRESS="${BASTION_ADDRESS:-}"
+BASTION_PORT="${BASTION_PORT:-}"
+BASTION_PUBKEY="${BASTION_PUBKEY:-}"
 AGENT_PORT=8700
 
 # Validate required parameters
@@ -23,9 +25,27 @@ if [ -z "$RESOURCE_ID" ]; then
     exit 1
 fi
 
+# Validate bastion configuration
+if [ -z "$BASTION_ADDRESS" ]; then
+    echo "❌ Error: BASTION_ADDRESS environment variable is required"
+    exit 1
+fi
+
+if [ -z "$BASTION_PORT" ]; then
+    echo "❌ Error: BASTION_PORT environment variable is required"
+    exit 1
+fi
+
+if [ -z "$BASTION_PUBKEY" ]; then
+    echo "❌ Error: BASTION_PUBKEY environment variable is required"
+    exit 1
+fi
+
 echo "🚀 Starting Kumulus resource installation..."
 echo "📋 Resource ID: $RESOURCE_ID"
 echo "🔗 Backend URL: $BACKEND_URL"
+echo "🏰 Bastion Address: $BASTION_ADDRESS"
+echo "🔌 Bastion Port: $BASTION_PORT"
 
 # Report installation progress
 report_progress() {
@@ -194,56 +214,133 @@ mark_ready() {
 download_agent() {
     echo "🔍 Checking agent installation..."
     report_progress "agent_install" "in_progress" "Downloading and running the Kumulus agent"
+
+    # Create the Kumulus installation directory if it doesn't exist
+    if [ ! -d "${AGENT_INSTALL_DIR}" ]; then
+        echo "📁 Creating Kumulus installation directory: ${AGENT_INSTALL_DIR}"
+        sudo mkdir -p "${AGENT_INSTALL_DIR}"
+        # Set proper ownership for the current user
+        sudo chown -R "$(whoami):$(whoami)" "${AGENT_INSTALL_DIR}"
+    fi
+
     # Checking if agent not already downloaded
-    if [ -f "${FILENAME}" ]; then
-        echo "✅ Agent already downloaded"
+    if [ -f "${AGENT_BINARY}" ]; then
+        echo "✅ Agent already downloaded at ${AGENT_BINARY}"
     else
-        echo "🔄 Downloading agent..."
-        # Download the agent
-        curl -L "https://github.com/kollectyve-labs/kumulus-tools/releases/download/v0.1.0-alpha/${FILENAME}" -o "${FILENAME}"
-        chmod +x "${FILENAME}"
+        echo "🔄 Downloading agent to ${AGENT_BINARY}..."
+        # Download the agent binary to the dedicated directory
+        curl -L "https://github.com/kollectyve-labs/kumulus-tools/releases/download/v0.1.0-alpha/${AGENT_BINARY_NAME}" -o "${AGENT_BINARY}"
+
+        # Set executable permissions
+        chmod +x "${AGENT_BINARY}"
+
+        # Verify download was successful
+        if [ -f "${AGENT_BINARY}" ]; then
+            echo "✅ Agent downloaded successfully to ${AGENT_BINARY}"
+        else
+            handle_error "agent_install" "Failed to download agent binary"
+        fi
     fi
 }
 
 # Run the agent
 run_agent() {
-    echo "🚀 Starting the agent..."
-    nohup ./"${FILENAME}" > agent.log 2>&1 &
-    echo $! > agent.pid
+    echo "🚀 Starting the agent from ${AGENT_BINARY}..."
+
+    # Create logs directory in the Kumulus installation directory (should already exist from download_agent)
+    if [ ! -d "${AGENT_INSTALL_DIR}/logs" ]; then
+        if [ -w "${AGENT_INSTALL_DIR}" ]; then
+            mkdir -p "${AGENT_INSTALL_DIR}/logs"
+        else
+            sudo mkdir -p "${AGENT_INSTALL_DIR}/logs"
+            sudo chown -R "$(whoami):$(whoami)" "${AGENT_INSTALL_DIR}/logs"
+        fi
+    fi
+
+    # Start the agent using the full path and store logs in the proper location
+    nohup "${AGENT_BINARY}" > "${AGENT_INSTALL_DIR}/logs/agent.log" 2>&1 &
+    AGENT_PID=$!
+    echo $AGENT_PID > "${AGENT_INSTALL_DIR}/agent.pid"
+
+    echo "✅ Agent started with PID: $AGENT_PID"
+    echo "📝 Logs available at: ${AGENT_INSTALL_DIR}/logs/agent.log"
+    echo "🔍 PID file stored at: ${AGENT_INSTALL_DIR}/agent.pid"
 }
 
 # Open ssh tunnel to the jumphost so that the agent can receive http requests through the bastion
 open_tunnel() {
     echo "Opening tunnel to the bastion..."
     # Check if ssh already in authorized keys
-    if grep -q "$BASTION_PUB" ~/.ssh/authorized_keys; then
+    if grep -q "$BASTION_PUBKEY" ~/.ssh/authorized_keys; then
         echo "✅ Bastion already in authorized keys"
     else
         echo "🔄 Adding bastion to authorized keys"
         # Add bastion public key to authorized keys
-        echo "$BASTION_PUB" >> ~/.ssh/authorized_keys
+        echo "$BASTION_PUBKEY" >> ~/.ssh/authorized_keys
     fi
-        # Open tunnel
-        ssh -N -R $BASTION_PORT:localhost:$AGENT_PORT ubuntu@$BASTION_ADDRESS
-        #echo $! > tunnel.pid
+    # Add bastion to known_hosts to avoid host verification prompt
+    echo "🔐 Adding bastion to known_hosts..."
+    ssh-keyscan -H "$BASTION_ADDRESS" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+    # Open tunnel and not block the script
+    # Use StrictHostKeyChecking=no to avoid interactive prompts
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=~/.ssh/known_hosts -N -R $BASTION_PORT:localhost:$AGENT_PORT ubuntu@$BASTION_ADDRESS &
+    TUNNEL_PID=$!
+    echo $TUNNEL_PID > "${AGENT_INSTALL_DIR}/tunnel.pid"
+    echo "✅ Tunnel opened with PID: $TUNNEL_PID"
+    echo "🔍 Tunnel PID file stored at: ${AGENT_INSTALL_DIR}/tunnel.pid"
 }
 
+# TODO: HANDLE SYSTEMD SERVICE LATER
 
-# TODO: Improve using ws or similar
 # Main installation flow
 main() {
     echo "🎯 Starting installation process..."
     send_specs
-    #install_docker
-    #download_agent
+    install_docker
+    download_agent
     mark_ready
-    #open_tunnel
+    open_tunnel
     #run_agent
+
+    # Wait a moment for processes to start
+    sleep 2
+
+    # Check if processes are running
+    echo ""
+    echo "🔍 Verifying installation..."
+
+    if [ -f "${AGENT_INSTALL_DIR}/agent.pid" ]; then
+        AGENT_PID=$(cat "${AGENT_INSTALL_DIR}/agent.pid")
+        if ps -p "$AGENT_PID" > /dev/null 2>&1; then
+            echo "✅ Agent is running (PID: $AGENT_PID)"
+        else
+            echo "⚠️  Agent process not found - check logs for errors"
+        fi
+    fi
+
+    if [ -f "${AGENT_INSTALL_DIR}/tunnel.pid" ]; then
+        TUNNEL_PID=$(cat "${AGENT_INSTALL_DIR}/tunnel.pid")
+        if ps -p "$TUNNEL_PID" > /dev/null 2>&1; then
+            echo "✅ SSH tunnel is active (PID: $TUNNEL_PID)"
+        else
+            echo "⚠️  SSH tunnel process not found - check connection"
+        fi
+    fi
 
     echo ""
     echo "🎉 Installation completed successfully!"
     echo "📊 Your resource is now ready to start providing computing power."
-    echo "You can check your dashboard"
+    echo ""
+    echo "📁 Kumulus agent installed at: ${AGENT_BINARY}"
+    echo "📝 Agent logs: ${AGENT_INSTALL_DIR}/logs/agent.log"
+    echo "🔍 Process IDs stored in: ${AGENT_INSTALL_DIR}/"
+    echo "🌐 You can check your dashboard to monitor the resource status"
+    echo ""
+    echo "💡 Troubleshooting commands:"
+    echo "   tail -f ${AGENT_INSTALL_DIR}/logs/agent.log  # Follow agent logs"
+    echo "   ps aux | grep flare-agent                    # Check agent process"
+    echo "   ps aux | grep ssh                            # Check tunnel process"
 }
 
 main

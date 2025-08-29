@@ -3,3 +3,4 @@
 !.env.example
 mnemonic.txt
 flare-agent-v*
+local/
